@@ -3,7 +3,7 @@ Code for reproducing the results to the NeurIPS submission "HiLLoC: Lossless Ima
 
 We adapt open source implementations for the Resnet VAE (https://github.com/openai/iaf) and PixelVAE (https://github.com/igul222/PixelVAE).
 
-The compression is implemented using [Craystack](craystack).
+The compression is implemented using [Craystack](../craystack).
 
 ### Training the models
  * RVAE. To train 24-layer model: `python --hpconfig depth=1,num_blocks=24,kl_min=0.1,learning_rate=0.002,batch_size=32,enable_iaf=False,dataset=<cifar10|small32_imagenet|small64_imagenet> --num_gpus 1 --mode train --logdir <log_path>`
