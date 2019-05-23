@@ -1,9 +1,7 @@
 import numpy as np
 
-import craystack.core as cs
 from craystack.bb_ans import BBANS
-from craystack.codecs import Uniform, DiagGaussianLatentStdBins, \
-    std_gaussian_centres
+from craystack import codecs
 
 
 def AutoRegressive_return_params(elem_param_fn, data_shape, params_shape, elem_idxs, elem_codec):
@@ -44,8 +42,8 @@ def TwoLayerVAE(gen_net2_partial,
     z2_view = lambda head: head[1]
     x_view = lambda head: head[2]
 
-    prior_z1_append, prior_z1_pop = cs.substack(Uniform(prior_prec), z1_view)
-    prior_z2_append, prior_z2_pop = cs.substack(Uniform(prior_prec), z2_view)
+    prior_z1_append, prior_z1_pop = codecs.substack(Uniform(prior_prec), z1_view)
+    prior_z2_append, prior_z2_pop = codecs.substack(Uniform(prior_prec), z2_view)
 
     def prior_append(message, latent):
         (z1, z2), theta1 = latent
@@ -57,8 +55,8 @@ def TwoLayerVAE(gen_net2_partial,
         message, z2 = prior_z2_pop(message)
         message, z1 = prior_z1_pop(message)
         # compute theta1
-        eps1_vals = std_gaussian_centres(prior_prec)[z1]
-        z2_vals = std_gaussian_centres(prior_prec)[z2]
+        eps1_vals = codecs.std_gaussian_centres(prior_prec)[z1]
+        z2_vals = codecs.std_gaussian_centres(prior_prec)[z2]
         theta1 = get_theta(eps1_vals, z2_vals)
         return message, ((z1, z2), theta1)
 
@@ -66,22 +64,22 @@ def TwoLayerVAE(gen_net2_partial,
         (z1, _), theta1 = latent
         # get z1_vals from the latent
         _, _, mu1_prior, sig1_prior = np.moveaxis(theta1, -1, 0)
-        eps1_vals = std_gaussian_centres(prior_prec)[z1]
+        eps1_vals = codecs.std_gaussian_centres(prior_prec)[z1]
         z1_vals = mu1_prior + sig1_prior * eps1_vals
-        append, pop = cs.substack(obs_codec(gen_net2_partial(z1_vals)), x_view)
+        append, pop = codecs.substack(obs_codec(gen_net2_partial(z1_vals)), x_view)
         return append, pop
 
     def posterior(data):
         mu1, sig1, h = rec_net1(data)
         mu2, sig2 = rec_net2(h)
 
-        post_z2_append, post_z2_pop = cs.substack(DiagGaussianLatentStdBins(
+        post_z2_append, post_z2_pop = codecs.substack(DiagGaussian_StdBins(
             mu2, sig2, latent_prec, prior_prec), z2_view)
 
         def posterior_append(message, latents):
             (z1, z2), theta1 = latents
-            z2_vals = std_gaussian_centres(prior_prec)[z2]
-            post_z1_append, _ = cs.substack(post1_codec(z2_vals, mu1, sig1), z1_view)
+            z2_vals = codecs.std_gaussian_centres(prior_prec)[z2]
+            post_z1_append, _ = codecs.substack(post1_codec(z2_vals, mu1, sig1), z1_view)
             theta1[..., 0] = mu1
             theta1[..., 1] = sig1
 
@@ -91,9 +89,9 @@ def TwoLayerVAE(gen_net2_partial,
 
         def posterior_pop(message):
             message, z2 = post_z2_pop(message)
-            z2_vals = std_gaussian_centres(prior_prec)[z2]
+            z2_vals = codecs.std_gaussian_centres(prior_prec)[z2]
             # need to return theta1 from the z1 pop
-            _, post_z1_pop = cs.substack(post1_codec(z2_vals, mu1, sig1), z1_view)
+            _, post_z1_pop = codecs.substack(post1_codec(z2_vals, mu1, sig1), z1_view)
             message, (z1, theta1) = post_z1_pop(message)
             return message, ((z1, z2), theta1)
 

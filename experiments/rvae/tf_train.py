@@ -453,8 +453,8 @@ def run_bbans(hps):
             return ag_tuple((np.reshape(head[:z_size], z_shape),
                              np.reshape(head[z_size:], shape)))
 
-        obs_codec = lambda h, z1: codecs.Logistic(*run_reconstruction(h, z1),
-                                                  obs_precision, bin_prec=8)
+        obs_codec = lambda h, z1: codecs.Logistic_UnifBins(*run_reconstruction(h, z1),
+                                                           obs_precision, bin_prec=8)
 
         return codecs.substack(
             ResNetVAE(run_all_contexts,
@@ -492,7 +492,7 @@ def run_bbans(hps):
 
     print("Encoding...")
     message = vae_append(init_message, test_images)
-    flat_message = codecs.flatten_benford(message)
+    flat_message = codecs.flatten(message)
     encode_t = time.time() - encode_t0
 
     print("All encoded in {:.2f}s".format(encode_t))
@@ -505,7 +505,7 @@ def run_bbans(hps):
 
     ## Decode
     decode_t0 = time.time()
-    message = codecs.unflatten_benford(flat_message, init_head_shape)
+    message = codecs.unflatten(flat_message, init_head_shape)
     message, images_ = vae_pop(message)
     decode_t = time.time() - decode_t0
 

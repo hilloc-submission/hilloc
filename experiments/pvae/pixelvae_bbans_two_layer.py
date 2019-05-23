@@ -2,34 +2,18 @@ import os
 import argparse
 import json
 import sys
-from functools import partial
 from itertools import product
-
-from scipy.stats import norm
 
 import tensorflow as tf
 import numpy as np
 from autograd.builtins import tuple as ag_tuple
-import craystack.vectorans as vrans
 import craystack as cs
-import craystack.bb_ans as bb_ans
-import craystack.codecs as codecs
+from craystack import bb_ans
+from craystack import codecs
 import time
 
 import tflib as lib
-import tflib.train_loop_2
-import tflib.ops.kl_unit_gaussian
-import tflib.ops.kl_gaussian_gaussian
-import tflib.ops.conv2d
-import tflib.ops.linear
-import tflib.ops.batchnorm
-import tflib.ops.embedding
 from tflib.ops.util import split, clamp_logsig_and_sig, DotDict
-
-import tflib.lsun_bedrooms
-import tflib.mnist_256
-import tflib.imagenet32
-import tflib.imagenet64
 
 import model
 
@@ -200,9 +184,9 @@ with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as session:
     # the post1 elem codec needs to read and write from the correct subhead
     # which is the part of the head corresponding to that (x,y) coord
     def post1_elem_codec(params, idx):
-        return cs.substack(codecs.DiagGaussianLatent(params[..., 0], params[..., 1],
-                                                     params[..., 2], params[..., 3],
-                                                     q_precision, prior_precision),
+        return cs.substack(codecs.DiagGaussian_GaussianBins(params[..., 0], params[..., 1],
+                                                            params[..., 2], params[..., 3],
+                                                            q_precision, prior_precision),
                            lambda head: head[idx])
 
 
@@ -255,7 +239,7 @@ with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as session:
                          np.reshape(head[latent1_size + latent2_size:], (batch_size,))))
 
 
-    vae_append, vae_pop = cs.repeat(cs.substack(
+    vae_append, vae_pop = codecs.repeat(codecs.substack(
         TwoLayerVAE(gen_net2_partial,
                     rec_net1, rec_net2,
                     post1_codec, obs_codec,
@@ -273,7 +257,7 @@ with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as session:
     encode_t0 = time.time()
     message = vae_append(init_message, images.astype('uint64'))
 
-    flat_message = codecs.flatten_benford(message)
+    flat_message = codecs.flatten(message)
     encode_t = time.time() - encode_t0
 
     print("All encoded in {:.2f}s".format(encode_t))
@@ -285,7 +269,7 @@ with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as session:
     print('Extra per dim: {:.2f}'.format((message_len - init_len) / num_dims))
 
     ## Decode
-    message = codecs.unflatten_benford(flat_message, batch_size + latent1_size + latent2_size)
+    message = codecs.unflatten(flat_message, batch_size + latent1_size + latent2_size)
 
     decode_t0 = time.time()
     message, images_ = vae_pop(message)

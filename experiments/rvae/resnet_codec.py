@@ -63,7 +63,7 @@ def ResNetVAE(up_pass, rec_net_top, rec_nets, gen_net_top, gen_nets, obs_codec,
             for latent, post_param in zip(latents, reversed(post_params)):
                 latent, (prior_mean, prior_stdd) = latent
                 post_mean, post_stdd = post_param
-                append, _ = codecs.substack(codecs.DiagGaussianLatent(post_mean, post_stdd,
+                append, _ = codecs.substack(codecs.DiagGaussian_GaussianBins(post_mean, post_stdd,
                                                            prior_mean, prior_stdd,
                                                            latent_prec, prior_prec),
                                         z_view)
@@ -74,7 +74,7 @@ def ResNetVAE(up_pass, rec_net_top, rec_nets, gen_net_top, gen_nets, obs_codec,
             # pop top-down
             (post_mean, post_stdd), h_rec = rec_net_top(contexts[-1])
             (prior_mean, prior_stdd), h_gen = gen_net_top()
-            _, pop = codecs.substack(codecs.DiagGaussianLatent(post_mean, post_stdd,
+            _, pop = codecs.substack(codecs.DiagGaussian_GaussianBins(post_mean, post_stdd,
                                                     prior_mean, prior_stdd,
                                                     latent_prec, prior_prec),
                                  z_view)
@@ -86,7 +86,7 @@ def ResNetVAE(up_pass, rec_net_top, rec_nets, gen_net_top, gen_nets, obs_codec,
 
                 (post_mean, post_stdd), h_rec = rec_net(h_rec, previous_latent_val, context)
                 (prior_mean, prior_stdd), h_gen = gen_net(h_gen, previous_latent_val)
-                _, pop = codecs.substack(codecs.DiagGaussianLatent(post_mean, post_stdd,
+                _, pop = codecs.substack(codecs.DiagGaussian_GaussianBins(post_mean, post_stdd,
                                                         prior_mean, prior_stdd,
                                                         latent_prec, prior_prec),
                                      z_view)
