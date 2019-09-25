@@ -1,9 +1,13 @@
+"""
+Vectorized implementation of rANS based on https://arxiv.org/abs/1402.3392
+"""
+
 import numpy as np
 
 
 rans_l = 1 << 31  # the lower bound of the normalisation interval
 
-def message_init(shape):
+def empty_message(shape):
     """
     Returns an empty ANS message of given shape.
     """

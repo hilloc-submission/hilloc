@@ -1,13 +1,15 @@
 import math
-from functools import partial
+from collections import namedtuple
 
 from scipy.stats import norm
 from scipy.special import expit as sigmoid
+from scipy.special import expit, logit
 
 import numpy as np
-import craystack.vectorans as vrans
+import craystack.rans as vrans
 import craystack.util as util
 
+Codec = namedtuple('Codec', ['push', 'pop'])
 
 def NonUniform(enc_statfun, dec_statfun, precision):
     """
@@ -61,18 +63,17 @@ def NonUniform(enc_statfun, dec_statfun, precision):
         start, freq = enc_statfun(symbol)
         assert np.all(start <= cf) and np.all(cf < start + freq)
         return pop_fun(start, freq), symbol
-    return push, pop
+    return Codec(push, pop)
 
 def repeat(codec, n):
     """
     Repeat codec n times.
 
-    Assumes that symbols is a Numpy array with symbols.shape[0] == n. Assume
-    that the codec doesn't change the shape of the ANS stack head.
+    Assumes that symbols is a list with len(symbols) == n.
     """
     push_, pop_ = codec
     def push(message, symbols):
-        assert np.shape(symbols)[0] == n
+        assert len(symbols) == n
         for symbol in reversed(symbols):
             message = push_(message, symbol)
         return message
@@ -82,8 +83,8 @@ def repeat(codec, n):
         for i in range(n):
             message, symbol = pop_(message)
             symbols.append(symbol)
-        return message, np.asarray(symbols)
-    return push, pop
+        return message, symbols
+    return Codec(push, pop)
 
 def serial(codecs):
     """
@@ -93,18 +94,18 @@ def serial(codecs):
     Codecs are allowed to change the shape of the ANS stack head.
     """
     def push(message, symbols):
-        for (push, _), symbol in reversed(list(zip(codecs, symbols))):
-            message = push(message, symbol)
+        for codec, symbol in reversed(list(zip(codecs, symbols))):
+            message = codec.push(message, symbol)
         return message
 
     def pop(message):
         symbols = []
-        for _, pop in codecs:
-            message, symbol = pop(message)
+        for codec in codecs:
+            message, symbol = codec.pop(message)
             symbols.append(symbol)
         return message, symbols
 
-    return push, pop
+    return Codec(push, pop)
 
 def substack(codec, view_fun):
     """
@@ -125,7 +126,7 @@ def substack(codec, view_fun):
         subhead, update = util.view_update(head, view_fun)
         (subhead, tail), data = pop_((subhead, tail), *args, **kwargs)
         return (update(subhead), tail), data
-    return push, pop
+    return Codec(push, pop)
 
 def parallel(codecs, view_funs):
     """
@@ -149,7 +150,7 @@ def parallel(codecs, view_funs):
             symbols.append(symbol)
         assert len(symbols) == len(codecs)
         return message, symbols
-    return push, pop
+    return Codec(push, pop)
 
 def shape(message):
     """Get the shape of the message head(s)"""
@@ -160,6 +161,11 @@ def shape(message):
         else:
             return np.shape(head)
     return _shape(head)
+
+def is_empty(message):
+    """Check if message is empty.
+    Useful for decoding something of unknown length"""
+    return (not message[1]) and np.all(message[0] == vrans.rans_l)
 
 _uniform_enc_statfun = lambda s: (s, 1)
 _uniform_dec_statfun = lambda cf: cf
@@ -208,7 +214,7 @@ def Benford64():
         message, x_higher = x_higher_pop(message)
         message, x_lower = x_lower_pop(message)
         return message, (1 << x_len) | (x_higher << 31) | x_lower
-    return push, pop
+    return Codec(push, pop)
 Benford64 = Benford64()
 
 def flatten(message):
@@ -260,12 +266,14 @@ def reshape_head(message, shape):
     information from the message and will fail if the message is empty.
     """
     head, tail = message
+    if head.shape == shape:
+        return message
     message = (np.ravel(head), tail)
     head, tail = _resize_head_1d(message, size=np.prod(shape))
     return np.reshape(head, shape), tail
 
-def random_stack(flat_len, shape, rng=np.random):
-    """Generate a random vrans stack"""
+def random_message(flat_len, shape, rng=np.random):
+    """Generate a random vrans stack."""
     arr = rng.randint(1 << 32, size=flat_len, dtype='uint32')
     return unflatten(arr, shape)
 
@@ -341,57 +349,47 @@ def Categorical(p, prec):
     dec_statfun = _ppf_from_cumulative_buckets(cumulative_buckets)
     return NonUniform(enc_statfun, dec_statfun, prec)
 
-def _create_logistic_buckets(means, log_scale, coding_prec, bin_prec, bin_lb, bin_ub):
-    buckets = np.linspace(bin_lb, bin_ub, (1 << bin_prec)+1)
-    buckets = np.broadcast_to(buckets, means.shape + ((1 << bin_prec)+1,))
-    inv_stdv = np.exp(-log_scale)
-    cdfs = inv_stdv * (buckets - means[..., np.newaxis])
-    cdfs[..., 0] = -np.inf
-    cdfs[..., -1] = np.inf
-    cdfs = sigmoid(cdfs)
-    probs = cdfs[..., 1:] - cdfs[..., :-1]
-    return _cumulative_buckets_from_probs(probs, coding_prec)
+def _discretize(cdf, ppf, low, high, bin_prec, coding_prec):
+    """
+    Utility function for forming a codec given a (continuous) cdf and its
+    inverse. Assumes that
 
-def _logistic_cdf(means, log_scale, coding_prec, bin_prec):
-    inv_stdv = np.exp(-log_scale)
-    def cdf(idx):
-        # can reduce mem footprint
-        buckets = np.linspace(-0.5, 0.5, (1 << bin_prec)+1)
-        buckets = np.append(buckets, np.inf)
-        bucket_ub = buckets[idx+1]
-        scaled = inv_stdv * (bucket_ub - means)
-        cdf = sigmoid(scaled)
-        return _nearest_int(cdf * (1 << coding_prec))
-    return cdf
+        grad(cdf) >= 2 ** (bin_prec - coding_prec) / (high - low)
 
-def _logistic_ppf(means, log_scale, coding_prec, bin_prec):
-    stdv = np.exp(log_scale)
-    def ppf(cf):
-        x = (cf + 0.5) / (1 << coding_prec)
-        logit = np.log(x) - np.log(1-x)
-        x = logit * stdv + means
-        bins = np.linspace(-0.5, 0.5, (1 << bin_prec)+1)[1:]
-        return np.uint64(np.digitize(x, bins) - 1)
-    return ppf
+    so that all intervals end up with non-zero mass.
+    """
+    def cdf_(idx):
+        x_low = low + (high - low) * idx / (1 << bin_prec)
+        return np.where(
+            idx >= 0, _nearest_int((1 << coding_prec) * cdf(x_low)), 0)
+    enc_statfun = _cdf_to_enc_statfun(cdf_)
+    def ppf_(cf):
+        x_max = ppf((cf + .5) / (1 << coding_prec))
+        return np.uint64(
+            np.floor((1 << bin_prec) * (x_max - low) / (high - low)))
+    return NonUniform(enc_statfun, ppf_, coding_prec)
 
-def Logistic_UnifBins(mean, log_scale, coding_prec, bin_prec, bin_lb, bin_ub,
-             no_zero_freqs=True, log_scale_min=-6):
+def Logistic_UnifBins(
+        means, log_scales, coding_prec, bin_prec, bin_lb, bin_ub):
     """
     Codec for logistic distributed data.
 
     The discretization is assumed to be uniform between bin_lb and bin_ub.
     no_zero_freqs=True will rebalance buckets, but is slower.
     """
-    if no_zero_freqs:
-        cumulative_buckets = _create_logistic_buckets(mean, log_scale, coding_prec, bin_prec,
-                                                      bin_lb, bin_ub)
-        enc_statfun = _cdf_to_enc_statfun(_cdf_from_cumulative_buckets(cumulative_buckets))
-        dec_statfun = _ppf_from_cumulative_buckets(cumulative_buckets)
-    else:
-        log_scale = max(log_scale, log_scale_min)
-        enc_statfun = _cdf_to_enc_statfun(_logistic_cdf(mean, log_scale, coding_prec, bin_prec))
-        dec_statfun = _logistic_ppf(mean, log_scale, coding_prec, bin_prec)
-    return NonUniform(enc_statfun, dec_statfun, coding_prec)
+    bin_range = bin_ub - bin_lb
+    def cdf(x):
+        cdf_min = (x - bin_lb) / bin_range * 2 ** (bin_prec - coding_prec)
+        cdf_max = 1 + (x - bin_ub) / bin_range * 2 ** (bin_prec - coding_prec)
+        return np.clip(
+            expit((x - means) / np.exp(log_scales)), cdf_min, cdf_max)
+
+    def ppf(cf):
+        ppf_max = bin_lb + cf * bin_range * 2 ** (coding_prec - bin_prec)
+        ppf_min = bin_ub + (cf - 1) * bin_range * 2 ** (coding_prec - bin_prec)
+        return np.clip(
+            np.exp(log_scales) * logit(cf) + means, ppf_min, ppf_max)
+    return _discretize(cdf, ppf, bin_lb, bin_ub, bin_prec, coding_prec)
 
 def _create_logistic_mixture_buckets(means, log_scales, logit_probs, coding_prec, bin_prec,
                                      bin_lb, bin_ub):
@@ -554,4 +552,4 @@ def AutoRegressive(param_fn, data_shape, params_shape, elem_idxs, elem_codec):
             message, elem = elem_pop(message)
             data[idx] = elem
         return message, data
-    return push, pop
+    return Codec(push, pop)
