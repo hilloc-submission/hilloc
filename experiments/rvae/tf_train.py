@@ -1,22 +1,25 @@
+import re
 import time
-from functools import lru_cache
-from itertools import repeat
+from functools import lru_cache, partial
 from operator import itemgetter
 from pathlib import Path
 from time import strftime
+import os
 
+import craystack as cs
 import numpy as np
 import observations
 import tensorflow as tf
 import tqdm
-from craystack import codecs
 from tensorflow.python.training.supervisor import Supervisor
 
-from rvae.datasets import sampling_testimage, test_image, sampling_testimages
+from rvae.datasets import sampling_testimage, test_image, sampling_testimages, full_imagenet
+from rvae.flif import FLIF
 from rvae.model import CVAE1, is_eval_model_in_original_format, FLAGS
 from rvae.model.layerwise import LayerwiseCVAE, latent_shape, latent_from_image_shape, image_shape
 from rvae.tf_utils.common import img_stretch, img_tile
 from rvae.tf_utils.hparams import HParams
+
 
 def relative_eval_model_path():
     return 'model.ckpt-1250528' if is_eval_model_in_original_format() else FLAGS.evalmodel
@@ -45,9 +48,12 @@ def get_default_hparams():
         image_size=None,  # Image size, automatically determined (input is ignored).
         enable_iaf=True,  # True for IAF, False for Gaussian posterior
         bidirectional=True,  # True for bidirectional, False for bottom-up inference
-        path=".", # Dataset path
+        path=".",  # Dataset path
         compression_always_variable=False,
-        compression_exclude_sizes=False
+        compression_exclude_sizes=False,
+        seed=0,  # seed for dataset generation
+        n_flif=5,  # number of images to compress with FLIF to start the bb chain (bbans mode)
+        initial_bits=int(1e8)  # if n_flif==0 then use a random message with this many bits
     )
 
 
@@ -79,6 +85,26 @@ def images(hps):
 
         return np.concatenate(quarters)
 
+    def tiled(images, tile_size=32):
+        num_tiles_y, num_tiles_x = images.shape[2] // tile_size, images.shape[3] // tile_size
+
+        images = images[..., :num_tiles_y * tile_size, :num_tiles_x * tile_size]
+
+        images = np.concatenate(np.split(images, num_tiles_y, axis=2), axis=0)
+        images = np.concatenate(np.split(images, num_tiles_x, axis=3), axis=0)
+
+        return images
+
+    def tiled_full(images, tile_size=32):
+        num_tiles_y, num_tiles_x = images.shape[2] // tile_size, images.shape[3] // tile_size
+        split_indices_y = [i * tile_size for i in range(1, num_tiles_y)]
+        split_indices_x = [i * tile_size for i in range(1, num_tiles_x)]
+        images = np.split(images, split_indices_y, axis=2)
+        images = [np.split(im, split_indices_x, axis=3) for im in images]
+        images = [tile for tiles in images for tile in tiles]
+
+        return images
+
     datasets = {
         "cifar10": cifar10,
         "cifar10to16": quartered(cifar10),
@@ -92,9 +118,55 @@ def images(hps):
         "small64to8_imagenet": quartered(imagenet64, times=3),
     }
 
+    full_imagenet_name = 'full_imagenet'
+    if hps.dataset.startswith(full_imagenet_name):
+        hps.eval_batch_size = 1
+        hps.batch_size = 1
+        if 'split' in hps.dataset:
+            n, split = re.findall('split_([0-9]*)_([0-9]*)', hps.dataset)[0]  # split_<n_per_split>_<split_num>
+            return None, full_imagenet(hps.path, int(n), split=int(split))
+
+        n = 50000 if hps.dataset == full_imagenet_name else int(hps.dataset[len(full_imagenet_name):])
+        return None, full_imagenet(hps.path, n, rng=np.random.RandomState(int(hps.seed)))
+
+    tiled_imagenet_name = "tiled_imagenet"
+    if hps.dataset.startswith(tiled_imagenet_name):
+        n = 50000 if hps.dataset == tiled_imagenet_name else int(hps.dataset[len(tiled_imagenet_name):])
+        return None, (np.concatenate([tiled(im) for im in full_imagenet(hps.path, n)], 0))
+
+    hybrid_imagenet_name = "hybrid_imagenet"
+    if hps.dataset.startswith(hybrid_imagenet_name):
+        n = 50000 if hps.dataset == hybrid_imagenet_name else int(hps.dataset[len(hybrid_imagenet_name):])
+
+        hps.eval_batch_size = 1
+        hps.batch_size = 1
+        n_flif = hps.n_flif
+        tile_sizes = [32, 64, 128]
+        n_ims_per_size = [4, 16, 300]
+        ims = full_imagenet(hps.path, n, rng=np.random.RandomState(int(hps.seed)))
+        flif_ims = ims[:n_flif]
+        im_locations = list(range(n_flif))  # mark the actual image boundaries
+        ims = ims[n_flif:]
+        out = []
+        for n_ims, tile_size in zip(n_ims_per_size, tile_sizes):
+            raw_ims = [im for im in ims[:n_ims] if im.shape[2] > tile_size and im.shape[3] > tile_size]
+            tiled_ims = [tiled_full(im, tile_size) for im in raw_ims]
+            n_tiles_per_im = [len(tiled_im) for tiled_im in tiled_ims]
+            for n in n_tiles_per_im:
+                im_locations.append(im_locations[-1] + n)
+            out += [tile for tiled_im in tiled_ims for tile in tiled_im]  # unroll
+            ims = ims[n_ims:]
+        if len(ims):
+            out += ims
+            last_el = im_locations[-1]
+            im_locations += [i + 1 + last_el for i in range(len(ims))]
+        print('Image locations:')
+        print(im_locations)
+        return None, flif_ims + sorted(out, key=lambda x: x.size, reverse=True)
+
     test_images_name = "test_images"
     if hps.dataset.startswith(test_images_name):
-        indices =  range(14) if hps.dataset == test_images_name else \
+        indices = range(14) if hps.dataset == test_images_name else \
             [int(i) for i in hps.dataset[len(test_images_name):].split(';')]
 
         hps.eval_batch_size = 1
@@ -107,6 +179,18 @@ def images(hps):
         hps.eval_batch_size = 1
         hps.batch_size = 1
         return None, test_image(index)
+
+    tiled_test_images_name = "tiled_test_images"
+    if hps.dataset.startswith(tiled_test_images_name):
+        indices = range(14) if hps.dataset == tiled_test_images_name else \
+            [int(i) for i in hps.dataset[len(tiled_test_images_name):].split(';')]
+
+        return None, (np.concatenate([tiled(test_image(index)) for index in indices], 0))
+
+    if hps.dataset.startswith("tiled_test_image"):
+        index = int(hps.dataset[len("tiled_test_image"):])
+
+        return None, (np.concatenate(tiled(test_image(index)), 0))
 
     if hps.dataset.startswith("sampling_test_images"):
         resolution = int(hps.dataset[len("sampling_test_images"):])
@@ -174,7 +258,8 @@ def run(hps):
         print("Initialized!")
 
     sv = Supervisor(is_chief=True,
-                    logdir=FLAGS.logdir + "/train/{}_{}".format(strftime('%Y%m%d-%H%M%S'), FLAGS.hpconfig),
+                    logdir=FLAGS.logdir + "/train/{}_{}".format(strftime('%Y%m%d-%H%M%S'),
+                                                                FLAGS.hpconfig),
                     summary_op=None,  # Automatic summaries don"t work with placeholders.
                     saver=saver,
                     global_step=model.global_step,
@@ -222,11 +307,17 @@ def run_eval(hps):
     all_channel_counts = []
     all_average_bits = []
 
-    for test_images in datasets if isinstance(datasets, list) else [datasets]:
+    total_bits = 0
+    total_dims = 0
+
+    for i, test_images in enumerate(datasets if isinstance(datasets, list) else [datasets]):
+        print(i)
         tf.reset_default_graph()
         hps.num_gpus = 1
         hps.batch_size = hps.eval_batch_size
         hps.image_size = validate_and_get_image_size(test_images)
+
+        total_dims += test_images.size
 
         # To avoid error due to GraphDef being over 2GB
         # (https://www.tensorflow.org/guide/datasets#consuming_numpy_arrays):
@@ -266,8 +357,10 @@ def run_eval(hps):
 
             all_channel_counts.append(hps.batch_size * np.prod(hps.image_size) * epoch_size)
             average_bits = float(np.mean(all_bits_per_dim))
+            total_bits += average_bits * test_images.size
             all_average_bits.append(average_bits)
             print("Step: %d Score: %.3f" % (global_step, average_bits))
+            print('Current bpd: {}'.format(total_bits / float(total_dims)))
             summary.value.add(tag='eval_bits_per_dim', simple_value=average_bits)
 
             if False:  # hps.k == 1:
@@ -336,69 +429,103 @@ def validate_and_get_image_size(images):
     return image_dimensions
 
 
-def rvae_variable_size_codec(codec_from_shape, latent_from_image_shape, image_count,
-                             dimensions=4, dimension_bits=16):
-    size_append, size_pop = codecs.repeat(codecs.Uniform(dimension_bits), dimensions)
+def rvae_serial_with_progress(codecs, previous_dims):
+    def push(message, symbols):
+        init_len = 32 * len(cs.flatten(message))
+        t_start = time.time()
+        dims = previous_dims
 
-    def append(message, symbol):
-        """append sizes and array in alternating order"""
-        assert len(symbol.shape) == dimensions
-
-        symbol_append, _ = codec_from_shape(symbol.shape)
-        head_size = np.prod(latent_from_image_shape(symbol.shape)) + np.prod(symbol.shape)
-        message = codecs.reshape_head(message, (head_size,))
-        message = symbol_append(message, symbol)
-        message = codecs.reshape_head(message, (1, ))
-        message = size_append(message, np.array(symbol.shape))
+        for i, (codec, symbol) in enumerate(reversed(list(zip(codecs, symbols)))):
+            t0 = time.time()
+            message = codec.push(message, symbol)
+            dims += symbol.size
+            flat_message = cs.flatten(message)
+            print(f"Encoded {i+1}/{len(symbols)}[{(i+1)/float(len(symbols))*100:.0f}%], "
+                  f"message length: {len(flat_message) * (4/1024):.0f}kB, "
+                  f"bpd: {32 * len(flat_message) / float(dims):.2f}, "
+                  f"net bitrate: {(32 * len(flat_message) - init_len) / (float(dims - previous_dims)):.2f}, "
+                  f"net dims: {dims - previous_dims}, "
+                  f"net bits: {32 * len(flat_message) - init_len}, "
+                  f"iter time: {time.time() - t0:.2f}s, "
+                  f"total time: {time.time() - t_start:.2f}s, "
+                  f"symbol shape: {symbol.shape}, "
+                  f"message length: {len(flat_message) * (4/1024):.0f}kB, "
+                  f"bpd: {32 * len(flat_message) / float(dims):.2f}"
+                  )
         return message
 
     def pop(message):
-        message, size = size_pop(message)
+        symbols = []
+        t_start = time.time()
+        for i, codec in enumerate(codecs):
+            t0 = time.time()
+            message, symbol = codec.pop(message)
+            symbols.append(symbol)
+            print(f"Decoded {i+1}/{len(symbols)}[{(i+1)/float(len(codecs))*100:.0f}%], "
+                  f"iter time: {time.time() - t0:.2f}s, "
+                  f"total time: {time.time() - t_start:.2f}s")
+        return message, symbols
+
+    return cs.Codec(push, pop)
+
+
+def rvae_variable_size_codec(codec_from_shape, latent_from_image_shape, image_count,
+                             dimensions=4, dimension_bits=16, previous_dims=0):
+    size_codec = cs.repeat(cs.Uniform(dimension_bits), dimensions)
+
+    def push(message, symbol):
+        """push sizes and array in alternating order"""
+        assert len(symbol.shape) == dimensions
+
+        codec = codec_from_shape(symbol.shape)
+        head_size = np.prod(latent_from_image_shape(symbol.shape)) + np.prod(symbol.shape)
+        message = cs.reshape_head(message, (head_size,))
+        message = codec.push(message, symbol)
+        message = cs.reshape_head(message, (1,))
+        message = size_codec.push(message, np.array(symbol.shape))
+        return message
+
+    def pop(message):
+        message, size = size_codec.pop(message)
         # TODO make codec 0 dimensional:
-        size = size[:, 0]
-        assert size.shape == (dimensions, )
+        size = np.array(size)[:, 0]
+        assert size.shape == (dimensions,)
         size = size.astype(np.int)
         head_size = np.prod(latent_from_image_shape(size)) + np.prod(size)
-        _, symbol_pop = codec_from_shape(tuple(size))
+        codec = codec_from_shape(tuple(size))
 
-        message = codecs.reshape_head(message, (head_size,))
-        message, symbol = symbol_pop(message)
-        message = codecs.reshape_head(message, (1,))
+        message = cs.reshape_head(message, (head_size,))
+        message, symbol = codec.pop(message)
+        message = cs.reshape_head(message, (1,))
 
         return message, symbol
 
-    return codecs.serial([(append, pop)] * image_count)
+    return rvae_serial_with_progress([cs.Codec(push, pop)] * image_count, previous_dims)
 
 
-def serial_with_shapes(symbol_codecs, shapes):
+def rvae_variable_known_size_codec(codec_from_image_shape, latent_from_image_shape, shapes, previous_dims):
     """
     Applies given codecs in series on a sequence of symbols requiring various ANS stack head shapes.
     The head shape required for each symbol is given through shapes.
     """
 
-    def reshape_append(append, shape, message, symbol):
-        message = codecs.reshape_head(message, shape)
-        message = append(message, symbol)
+    def reshape_push(shape, message, symbol):
+        head_shape = (np.prod(latent_from_image_shape(shape)) + np.prod(shape),)
+        message = cs.reshape_head(message, head_shape)
+        codec = codec_from_image_shape(shape)
+        message = codec.push(message, symbol)
         return message
 
-    def reshape_pop(pop, shape, message):
-        message = codecs.reshape_head(message, shape)
-        message, symbol = pop(message)
+    def reshape_pop(shape, message):
+        head_shape = (np.prod(latent_from_image_shape(shape)) + np.prod(shape),)
+        message = cs.reshape_head(message, head_shape)
+        codec = codec_from_image_shape(shape)
+        message, symbol = codec.pop(message)
         return message, symbol
 
-    create_reshape_append = lambda append, shape: lambda m, s: reshape_append(append, shape, m, s)
-    create_reshape_pop = lambda pop, shape: lambda m: reshape_pop(pop, shape, m)
-
-    return codecs.serial([
-        (create_reshape_append(append, shape), create_reshape_pop(pop, shape))
-        for (append, pop), shape in zip(symbol_codecs, shapes)])
-
-
-def rvae_variable_known_size_codec(codec_from_image_shape, latent_from_image_shape, image_shapes):
-    image_codecs = [codec_from_image_shape(s) for s in image_shapes]
-    head_shapes = [(np.prod(latent_from_image_shape(s)) + np.prod(s),) for s in image_shapes]
-
-    return serial_with_shapes(image_codecs, head_shapes)
+    return rvae_serial_with_progress([
+        cs.Codec(partial(reshape_push, shape), partial(reshape_pop, shape))
+        for shape in shapes], previous_dims)
 
 
 def run_bbans(hps):
@@ -406,22 +533,28 @@ def run_bbans(hps):
     from rvae.resnet_codec import ResNetVAE
 
     hps.num_gpus = 1
-    batch_size = 1
-    hps.batch_size = batch_size
+    hps.batch_size = 1
+    batch_size = hps.batch_size
     hps.eval_batch_size = batch_size
+    n_flif = hps.n_flif
 
     _, datasets = images(hps)
     datasets = datasets if isinstance(datasets, list) else [datasets]
     test_images = [np.array([image]).astype('uint64')
                    for dataset in datasets for image in dataset]
-
+    n_batches = len(test_images) // batch_size
+    test_images = [np.concatenate(test_images[i*batch_size:(i+1)*batch_size], axis=0)
+                   for i in range(n_batches)]
+    flif_images = test_images[:n_flif]
+    vae_images = test_images[n_flif:]
     num_dims = np.sum([batch.size for batch in test_images])
+    flif_dims = np.sum([batch.size for batch in flif_images]) if flif_images else 0
 
     prior_precision = 10
     obs_precision = 24
-    q_precision = 20
+    q_precision = 18
 
-    @lru_cache()
+    @lru_cache(maxsize=1)
     def codec_from_shape(shape):
         print("Creating codec for shape " + str(shape))
 
@@ -440,8 +573,7 @@ def run_bbans(hps):
         saver = tf.train.Saver(model.avg_dict)
         config = tf.ConfigProto(allow_soft_placement=True,
                                 intra_op_parallelism_threads=4,
-                                inter_op_parallelism_threads=4,
-                                device_count={'GPU': 0})
+                                inter_op_parallelism_threads=4)
         sess = tf.Session(config=config, graph=graph)
         saver.restore(sess, restore_path())
 
@@ -453,10 +585,11 @@ def run_bbans(hps):
             return ag_tuple((np.reshape(head[:z_size], z_shape),
                              np.reshape(head[z_size:], shape)))
 
-        obs_codec = lambda h, z1: codecs.Logistic_UnifBins(*run_reconstruction(h, z1),
-                                                           obs_precision, bin_prec=8)
+        obs_codec = lambda h, z1: cs.Logistic_UnifBins(*run_reconstruction(h, z1),
+                                                       obs_precision, bin_prec=8,
+                                                       bin_lb=-0.5, bin_ub=0.5)
 
-        return codecs.substack(
+        return cs.substack(
             ResNetVAE(run_all_contexts,
                       run_top_posterior, runs_down_posterior,
                       run_top_prior, runs_down_prior,
@@ -465,67 +598,71 @@ def run_bbans(hps):
 
     is_fixed = not hps.compression_always_variable and \
                (len(set([dataset[0].shape[-2:] for dataset in datasets])) == 1)
-    fixed_size_codec = lambda: codecs.repeat(codec_from_shape(test_images[0].shape), len(test_images))
+    fixed_size_codec = lambda: cs.repeat(codec_from_shape(vae_images[0].shape), len(vae_images))
     variable_codec_including_sizes = lambda: rvae_variable_size_codec(codec_from_shape,
-                                        latent_from_image_shape=latent_from_image_shape(hps),
-                                        image_count=len(test_images))
+                                                                      latent_from_image_shape=latent_from_image_shape(
+                                                                          hps),
+                                                                      image_count=len(vae_images),
+                                                                      previous_dims=flif_dims)
     variable_known_sizes_codec = lambda: rvae_variable_known_size_codec(
         codec_from_image_shape=codec_from_shape,
         latent_from_image_shape=latent_from_image_shape(hps),
-        image_shapes=[i.shape for i in test_images])
+        shapes=[i.shape for i in vae_images],
+        previous_dims=flif_dims)
     variable_size_codec = \
         variable_known_sizes_codec if hps.compression_exclude_sizes else variable_codec_including_sizes
     codec = fixed_size_codec if is_fixed else variable_size_codec
-    vae_append, vae_pop = codec()
-
-    rng = np.random.RandomState(0)
+    vae_push, vae_pop = codec()
 
     np.seterr(divide='raise')
 
-    # Codec for adding extra bits to the start of the chain (necessary for bits back).
-    other_bits_count = 100000000
+    if n_flif:
+        print('Using FLIF to encode initial images...')
+        flif_push, flif_pop = cs.repeat(cs.repeat(FLIF, batch_size), n_flif)
+        message = cs.empty_message((1,))
+        message = flif_push(message, flif_images)
+    else:
+        print('Creating a random initial message...')
+        message = cs.random_message(hps.initial_bits, (1,))
 
-    encode_t0 = time.time()
     init_head_shape = (np.prod(image_shape(hps)) + np.prod(latent_shape(hps)) if is_fixed else 1,)
-    init_message = codecs.random_stack(other_bits_count, init_head_shape, rng)
-    init_len = 32 * other_bits_count
+    message = cs.reshape_head(message, init_head_shape)
 
-    print("Encoding...")
-    message = vae_append(init_message, test_images)
-    flat_message = codecs.flatten(message)
+    print("Encoding with VAE...")
+    encode_t0 = time.time()
+    message = vae_push(message, vae_images)
     encode_t = time.time() - encode_t0
-
     print("All encoded in {:.2f}s".format(encode_t))
 
+    flat_message = cs.flatten(message)
     message_len = 32 * len(flat_message)
     print("Used {} bits.".format(message_len))
     print("This is {:.2f} bits per dim.".format(message_len / num_dims))
-    print('Extra bits per dim: {:.2f}'.format((message_len - init_len) / num_dims))
-    print('Extra bits: {:.2f}'.format(message_len - init_len))
+    if n_flif == 0:
+        extra_bits = message_len - 32 * hps.initial_bits
+        print('Extra bits: {}'.format(extra_bits))
+        print('This is {:.2f} bits per dim.'.format(extra_bits / num_dims))
 
-    ## Decode
+    print('Decoding with VAE...')
     decode_t0 = time.time()
-    message = codecs.unflatten(flat_message, init_head_shape)
-    message, images_ = vae_pop(message)
-    decode_t = time.time() - decode_t0
+    message = cs.unflatten(flat_message, init_head_shape)
+    message, decoded_vae_images = vae_pop(message)
+    message = cs.reshape_head(message, (1,))
 
+    decode_t = time.time() - decode_t0
     print('All decoded in {:.2f}s'.format(decode_t))
 
-    assert len(test_images) == len(images_), (len(test_images), len(images_))
-    for test_image, image in zip(test_images, images_):
-        np.testing.assert_equal(test_image, image)
-    init_head, init_tail = init_message
+    assert len(vae_images) == len(decoded_vae_images), (len(vae_images), len(decoded_vae_images))
+    for test_image, decoded_image in zip(vae_images, decoded_vae_images):
+        np.testing.assert_equal(test_image, decoded_image)
 
-    message = codecs.reshape_head(message, init_head_shape)
-    head, tail = message
-    assert init_head.shape == head.shape, (init_head.shape, head.shape)
-    assert np.all(init_head == head)
+    if n_flif:
+        print('Decoding with FLIF...')
+        message, decoded_flif_images = flif_pop(message)
+        for test_image, decoded_image in zip(flif_images, decoded_flif_images):
+            np.testing.assert_equal(test_image, decoded_image)
+        assert cs.is_empty(message)
 
-    # use this, or get into recursion issues
-    while init_tail:
-        el, init_tail = init_tail
-        el_, tail = tail
-        assert el == el_
 
 def main(_):
     hps = get_default_hparams().parse(FLAGS.hpconfig)

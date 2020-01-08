@@ -67,8 +67,20 @@ def test_image_files(path=Path('.')):
     return image_files
 
 
+def full_imagenet(path, n, rng=None, split=None):
+    path = Path(path) / 'imagenet' / 'val'
+    im_files = sorted(path.glob('*.JPEG'))
+    if rng is not None:
+        im_files = rng.choice(im_files, n)
+    elif split is not None:
+        im_files = im_files[split*n: (split+1)*n]
+    else:
+        im_files = im_files[:n]
+    return [image_files_to_array([f]) for f in im_files]
+
+
 def round_to_even(x):
-    return int(round(x / 2) * 2)
+    return int(np.floor(x / 2) * 2)
 
 
 def scale_down_and_round_even(image, max_pixels=default_max_pixels):
@@ -79,8 +91,7 @@ def scale_down_and_round_even(image, max_pixels=default_max_pixels):
 
     orig_pixels = np.prod(image.shape[:-1])
     scale = np.sqrt(max_pixels / orig_pixels)
-    if scale >= 1:
-        return image
+    scale = min(scale, 1.)  # dont upscale
 
     new_x = round_to_even(image.shape[0] * scale)
     new_y = round_to_even(image.shape[1] * scale)
